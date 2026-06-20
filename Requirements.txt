@@ -3,7 +3,10 @@ langgraph
 langchain-core
 langchain-cerebras
 langchain-community
+langchain-tavily
 tavily-python
 pydantic>=2
 python-dotenv
 requests
+Pillow
+huggingface-hub
