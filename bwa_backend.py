@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import operator
 import os
-import re
-from datetime import date, timedelta
+import json
+import requests
+import time
+
+from datetime import date
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
+from langchain_cerebras import ChatCerebras
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.tools.tavily_search import TavilySearchResults
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,21 +28,35 @@ load_dotenv()
 #   merge_content -> decide_images -> generate_and_place_images
 # ============================================================
 
-
-# -----------------------------
+# ──────────────────────────────────────────
 # 1) Schemas
-# -----------------------------
+# ──────────────────────────────────────────
+
 class Task(BaseModel):
     id: int
     title: str
-    goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
-    bullets: List[str] = Field(..., min_length=3, max_length=6)
-    target_words: int = Field(..., description="Target words (120–550).")
-
+    goal: str = Field(
+        ...,
+        description="One sentence describing what the reader should be able to do/understand after this section.",
+    )
+    bullets: Annotated[List[str], Field(min_length=3, max_length=6)] = Field(
+        ...,
+        description="3-6 concrete, non-overlapping subpoints to cover in this section.",
+    )
+    target_words: int = Field(
+        ..., description="Target word count for this section (120-550)."
+    )
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
     requires_code: bool = False
+    @field_validator("bullets", mode="before")
+    @classmethod
+    def ensure_min_bullets(cls, v: list) -> list:
+        if isinstance(v, list):
+            while len(v) < 3:
+                v.append("Explore additional aspects of this topic in depth.")
+        return v
 
 
 class Plan(BaseModel):
@@ -51,26 +69,31 @@ class Plan(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    title: str
     url: str
-    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
+    title: Optional[str] = None
+    published_at: Optional[str] = None  # keep if Tavily provides; DO NOT rely on it
     snippet: Optional[str] = None
     source: Optional[str] = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def fallback_title(cls, v, info):
+        if v:
+            return v
+        url = info.data.get("url", "")
+        return url or "Untitled"
 
 
 class RouterDecision(BaseModel):
     needs_research: bool
     mode: Literal["closed_book", "hybrid", "open_book"]
-    reason: str
     queries: List[str] = Field(default_factory=list)
-    max_results_per_query: int = Field(5)
 
 
 class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-# ---- Image planning schema (ported from your image flow) ----
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
     filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
@@ -85,287 +108,302 @@ class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
 
+
 class State(TypedDict):
     topic: str
-
-    # routing / research
     mode: str
     needs_research: bool
     queries: List[str]
     evidence: List[EvidenceItem]
     plan: Optional[Plan]
-
-    # recency
     as_of: str
     recency_days: int
-
-    # workers
-    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
-
-    # reducer/image
+    sections: Annotated[List[tuple[str]], operator.add]
     merged_md: str
     md_with_placeholders: str
     image_specs: List[dict]
-
     final: str
 
 
-# -----------------------------
-# 2) LLM
-# -----------------------------
-llm = ChatOpenAI(model="gpt-4.1-mini")
+llm = ChatCerebras(
+    model="gpt-oss-120b",  # ← abhi available
+    temperature=0.3,
+    cerebras_api_key=os.environ["CEREBRAS_API_KEY"]
+)
 
-# -----------------------------
-# 3) Router
-# -----------------------------
-ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
 
-Decide whether web research is needed BEFORE planning.
 
-Modes:
-- closed_book (needs_research=false): evergreen concepts.
-- hybrid (needs_research=true): evergreen + needs up-to-date examples/tools/models.
-- open_book (needs_research=true): volatile weekly/news/"latest"/pricing/policy.
+ROUTER_SYSTEM = """
+Return ONLY valid JSON.
 
-If needs_research=true:
-- Output 3–10 high-signal, scoped queries.
-- For open_book weekly roundup, include queries reflecting last 7 days.
+Schema:
+{
+  "needs_research": boolean,
+  "mode": "closed_book|hybrid|open_book",
+  "queries": ["query1", "query2"]
+}
+
+No markdown.
+No explanations.
+No extra keys.
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
+    print("=" * 80)
+    print("ROUTER NODE VERSION 2026-06-20")
+    print("TOPIC:", state["topic"])
+    print("=" * 80)
+
+    topic = state["topic"]
+
+    response = llm.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+            HumanMessage(
+                content=f"Topic: {topic}"
+            ),
         ]
     )
 
-    if decision.mode == "open_book":
-        recency_days = 7
-    elif decision.mode == "hybrid":
-        recency_days = 45
-    else:
-        recency_days = 3650
+    print("RAW RESPONSE:")
+    print(response.content)
+
+    data = json.loads(response.content)
+
+    decision = RouterDecision.model_validate(data)
 
     return {
         "needs_research": decision.needs_research,
         "mode": decision.mode,
         "queries": decision.queries,
-        "recency_days": recency_days,
     }
 
-def route_next(state: State) -> str:
-    return "research" if state["needs_research"] else "orchestrator"
 
-# -----------------------------
+# ──────────────────────────────────────────
 # 4) Research (Tavily)
-# -----------------------------
+# ──────────────────────────────────────────
+
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    if not os.getenv("TAVILY_API_KEY"):
-        return []
-    try:
-        from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
-        tool = TavilySearchResults(max_results=max_results)
-        results = tool.invoke({"query": query})
-        out: List[dict] = []
-        for r in results or []:
-            out.append(
-                {
-                    "title": r.get("title") or "",
-                    "url": r.get("url") or "",
-                    "snippet": r.get("content") or r.get("snippet") or "",
-                    "published_at": r.get("published_date") or r.get("published_at"),
-                    "source": r.get("source"),
-                }
-            )
-        return out
-    except Exception:
-        return []
+    tool = TavilySearchResults(max_results=max_results)
+    results = tool.invoke({"query": query})
 
-def _iso_to_date(s: Optional[str]) -> Optional[date]:
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s[:10])
-    except Exception:
-        return None
+    normalized: List[dict] = []
+    for r in results or []:
+        snippet = r.get("content") or r.get("snippet") or ""
+        normalized.append(
+            {
+                "title": r.get("title") or "",
+                "url": r.get("url") or "",
+                "snippet": snippet[:300],   
+                "published_at": r.get("published_date") or r.get("published_at"),
+                "source": r.get("source"),
+            }
+        )
+    return normalized
 
-RESEARCH_SYSTEM = """You are a research synthesizer.
 
-Given raw web search results, produce EvidenceItem objects.
+RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
+
+Given raw web search results, produce a deduplicated list of EvidenceItem objects.
 
 Rules:
 - Only include items with a non-empty url.
-- Prefer relevant + authoritative sources.
-- Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
+- Prefer relevant + authoritative sources (company blogs, docs, reputable outlets).
+- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
+  If missing or unclear, set published_at=null. Do NOT guess.
 - Keep snippets short.
 - Deduplicate by URL.
 """
 
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:10]
-    raw: List[dict] = []
-    for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+    # take the first 10 queries from state
+    queries = (state.get("queries", []) or [])[:2]
+    max_results = 3
 
-    if not raw:
+    raw_results: List[dict] = []
+
+    for q in queries:
+        raw_results.extend(_tavily_search(q, max_results=max_results))
+
+    if not raw_results:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
+    response = llm.invoke(
         [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"As-of date: {state['as_of']}\n"
-                    f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
-                )
-            ),
+        SystemMessage(
+            content=RESEARCH_SYSTEM +
+            "\nReturn ONLY valid JSON matching EvidencePack."
+        ),
+        HumanMessage(
+            content=f"Raw results:\n{json.dumps(raw_results[:5])}"
+        ),
         ]
     )
+    raw = response.content.strip()
 
+    if raw.startswith("```"):
+        raw = raw.replace("```json", "")
+        raw = raw.replace("```", "")
+        raw = raw.strip()
+
+    pack = EvidencePack.model_validate_json(raw)
+
+    # Deduplicate by URL
     dedup = {}
     for e in pack.evidence:
-        if e.url:
-            dedup[e.url] = e
-    evidence = list(dedup.values())
+       if e.url:
+        dedup[e.url] = e
 
-    if state.get("mode") == "open_book":
-        as_of = date.fromisoformat(state["as_of"])
-        cutoff = as_of - timedelta(days=int(state["recency_days"]))
-        evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
+    return {"evidence": list(dedup.values())}
 
-    return {"evidence": evidence}
 
-# -----------------------------
+
+# ──────────────────────────────────────────
 # 5) Orchestrator (Plan)
-# -----------------------------
+# ──────────────────────────────────────────
+
 ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
-Produce a highly actionable outline for a technical blog post.
+Your job is to produce a highly actionable outline for a technical blog post.
 
-Requirements:
-- 5–9 tasks, each with goal + 3–6 bullets + target_words.
-- Tags are flexible; do not force a fixed taxonomy.
+Hard requirements:
+- Create 5-9 sections (tasks) suitable for the topic and audience.
+- Each task must include:
+  1) goal (1 sentence)
+  2) 3-6 bullets that are concrete, specific, and non-overlapping
+  3) target word count (120-550)
 
-Grounding:
-- closed_book: evergreen, no evidence dependence.
-- hybrid: use evidence for up-to-date examples; mark those tasks requires_research=True and requires_citations=True.
-- open_book: weekly/news roundup:
-  - Set blog_kind="news_roundup"
-  - No tutorial content unless requested
-  - If evidence is weak, plan should explicitly reflect that (don’t invent events).
+Quality bar:
+- Assume the reader is a developer; use correct terminology.
+- Bullets must be actionable: build/compare/measure/verify/debug.
+- Ensure the overall plan includes at least 2 of these somewhere:
+  * minimal code sketch / MWE (set requires_code=True for that section)
+  * edge cases / failure modes
+  * performance/cost considerations
+  * security/privacy considerations (if relevant)
+  * debugging/observability tips
 
-Output must match Plan schema.
+Grounding rules:
+- Mode closed_book: keep it evergreen; do not depend on evidence.
+- Mode hybrid:
+  - Use evidence for up-to-date examples (models/tools/releases) in bullets.
+  - Mark sections using fresh info as requires_research=True and requires_citations=True.
+- Mode open_book:
+  - Set blog_kind = "news_roundup".
+  - Every section is about summarizing events + implications.
+  - DO NOT include tutorial/how-to sections unless user explicitly asked for that.
+  - If evidence is empty or insufficient, create a plan that transparently says "insufficient sources"
+    and includes only what can be supported.
+
+Output must strictly match the Plan schema.
 """
 
-def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
-    mode = state.get("mode", "closed_book")
-    evidence = state.get("evidence", [])
+ORCH_SYSTEM_JSON = (
+    ORCH_SYSTEM
+    + "\n\nIMPORTANT: You must respond with a single valid JSON object only. "
+      "Do not include markdown fences, comments, or any text outside the JSON object. "
+      "The JSON object must match this schema:\n"
+    + json.dumps(Plan.model_json_schema())
+)
 
-    forced_kind = "news_roundup" if mode == "open_book" else None
+def orchestrator_node(state: State) -> dict:
+    evidence = state.get("evidence", [])
+    mode = state.get("mode", "closed_book")
+
+    planner = llm.with_structured_output(Plan, method="json_mode")
 
     plan = planner.invoke(
         [
-            SystemMessage(content=ORCH_SYSTEM),
+            SystemMessage(content=ORCH_SYSTEM_JSON),
             HumanMessage(
                 content=(
                     f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                    f"Mode: {mode}\n\n"
+                    f"Respond with JSON only.\n\n"
+                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                    f"{[e.model_dump() for e in evidence][:16]}"
                 )
             ),
         ]
     )
-    if forced_kind:
-        plan.blog_kind = "news_roundup"
-
     return {"plan": plan}
 
 
-# -----------------------------
+
+
+# ──────────────────────────────────────────
 # 6) Fanout
-# -----------------------------
-def fanout(state: State):
-    assert state["plan"] is not None
-    return [
-        Send(
-            "worker",
-            {
-                "task": task.model_dump(),
-                "topic": state["topic"],
-                "mode": state["mode"],
-                "as_of": state["as_of"],
-                "recency_days": state["recency_days"],
-                "plan": state["plan"].model_dump(),
-                "evidence": [e.model_dump() for e in state.get("evidence", [])],
-            },
-        )
-        for task in state["plan"].tasks
-    ]
+# ──────────────────────────────────────────
 
-# -----------------------------
-# 7) Worker
-# -----------------------------
-WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
-Write ONE section of a technical blog post in Markdown.
+def fanout(state: State) -> dict:
+    all_sections = []
+    
+    for task in state["plan"].tasks:
+        print(f"[Worker {task.id}] Writing: {task.title}...")
+        
+        payload = {
+            "task": task.model_dump(),
+            "topic": state["topic"],
+            "mode": state["mode"],
+            "plan": state["plan"].model_dump(),
+            "evidence": [e.model_dump() for e in state.get("evidence", [])],
+        }
+        
+        result = worker(payload)  # ← direct call, no Send()
+        all_sections.append(result["sections"][0])  # (task.id, section_md)
+        
+        print(f"[Worker {task.id}] Done ✓")
+        time.sleep(4)  # TPM limit avoid karo
+    
+    return {"sections": all_sections}
 
-Constraints:
-- Cover ALL bullets in order.
-- Target words ±15%.
-- Output only section markdown starting with "## <Section Title>".
 
-Scope guard:
-- If blog_kind=="news_roundup", do NOT drift into tutorials (scraping/RSS/how to fetch).
-  Focus on events + implications.
 
-Grounding:
-- If mode=="open_book": do not introduce any specific event/company/model/funding/policy claim unless supported by provided Evidence URLs.
-  For each supported claim, attach a Markdown link ([Source](URL)).
-  If unsupported, write "Not found in provided sources."
-- If requires_citations==true (hybrid tasks): cite Evidence URLs for external claims.
+def worker(payload: dict) -> dict:
 
-Code:
-- If requires_code==true, include at least one minimal snippet.
-"""
-
-def worker_node(payload: dict) -> dict:
+    # payload contains what we sent (as dicts from fanout) — rebuild as objects
     task = Task(**payload["task"])
+    topic = payload["topic"]
     plan = Plan(**payload["plan"])
-    evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
-    bullets_text = "\n- " + "\n- ".join(task.bullets)
-    evidence_text = "\n".join(
-        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
-        for e in evidence[:20]
-    )
+    bullets_text = "\n-" + "\n-".join(task.bullets)
 
     section_md = llm.invoke(
         [
-            SystemMessage(content=WORKER_SYSTEM),
+            SystemMessage(
+                content=(
+                    "You are a senior technical writer and developer advocate. Write ONE section of a technical blog post in Markdown.\n"
+                    "Hard constraints:\n"
+                    "- Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).\n"
+                    "- Stay close to the Target words (±15%).\n"
+                    "- Output ONLY the section content in Markdown (no blog title H1, no extra commentary).\n\n"
+                    "Technical quality bar:\n"
+                    "- Be precise and implementation-oriented (developers should be able to apply it).\n"
+                    "- Prefer concrete details over abstractions: APIs, data structures, protocols, and exact terms.\n"
+                    "- When relevant, include at least one of:\n"
+                    "  * a small code snippet (minimal, correct, and idiomatic)\n"
+                    "  * a tiny example input/output\n"
+                    "  * a checklist of steps\n"
+                    "  * a diagram described in text (e.g., 'Flow: A -> B -> C')\n"
+                    "- Explain trade-offs briefly (performance, cost, complexity, reliability).\n"
+                    "- Call out edge cases / failure modes and what to do about them.\n"
+                    "- If you mention a best practice, add the 'why' in one sentence.\n\n"
+                    "Markdown style:\n"
+                    "- Start with a '## <Section Title>' heading.\n"
+                    "- Use short paragraphs, bullet lists where helpful, and code fences for code.\n"
+                    "- Avoid fluff. Avoid marketing language.\n"
+                    "- If you include code, keep it focused on the bullet being addressed.\n"
+                )
+            ),
             HumanMessage(
                 content=(
-                    f"Blog title: {plan.blog_title}\n"
+                    f"Blog: {plan.blog_title}\n"
                     f"Audience: {plan.audience}\n"
                     f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {payload['topic']}\n"
-                    f"Mode: {payload.get('mode')}\n"
-                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
-                    f"Section title: {task.title}\n"
+                    f"Topic: {topic}\n\n"
+                    f"Section: {task.title}\n"
                     f"Goal: {task.goal}\n"
                     f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
+                    f"Bullets: {bullets_text}\n"
                 )
             ),
         ]
@@ -373,14 +411,17 @@ def worker_node(payload: dict) -> dict:
 
     return {"sections": [(task.id, section_md)]}
 
-# ============================================================
+
+
+
+# ========================================
 # 8) ReducerWithImages (subgraph)
 #    merge_content -> decide_images -> generate_and_place_images
-# ============================================================
+# ========================================
+
 def merge_content(state: State) -> dict:
     plan = state["plan"]
-    if plan is None:
-        raise ValueError("merge_content called without plan.")
+
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
@@ -396,23 +437,49 @@ Rules:
 - Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
 - If no images needed: md_with_placeholders must equal input and images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
 """
 
+DECIDE_IMAGES_SYSTEM_JSON = (
+    DECIDE_IMAGES_SYSTEM
+    + """
+
+IMPORTANT: Respond with a single valid JSON object only.
+No markdown fences, no comments, no extra text.
+
+Required JSON structure:
+{
+  "md_with_placeholders": "<complete blog markdown with [[IMAGE_N]] placeholders inserted>",
+  "images": [
+    {
+      "placeholder": "[[IMAGE_1]]",
+      "filename": "images/example.png",
+      "alt": "Alt text here",
+      "caption": "Caption here",
+      "prompt": "Detailed image generation prompt",
+      "size": "1536x1024",
+      "quality": "medium"
+    }
+  ]
+}
+"""
+)
+
+
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
+
+    planner = llm.with_structured_output(GlobalImagePlan, method="json_mode")
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
 
     image_plan = planner.invoke(
         [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            SystemMessage(content=DECIDE_IMAGES_SYSTEM_JSON),
             HumanMessage(
                 content=(
                     f"Blog kind: {plan.blog_kind}\n"
                     f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
+                    "Insert placeholders + propose image prompts. Respond with JSON only.\n\n"
                     f"{merged_md}"
                 )
             ),
@@ -425,62 +492,38 @@ def decide_images(state: State) -> dict:
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
-    from google import genai
-    from google.genai import types
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
+def _generate_image_bytes(prompt: str) -> bytes:
+    api_key = os.environ.get("HF_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+        raise RuntimeError("HF_API_KEY is not set.")
 
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
-    )
-
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
+    MODELS = [
+        "black-forest-labs/FLUX.1-schnell",
+        "stabilityai/stable-diffusion-3.5-large-turbo",
+    ]
+    
+    last_error = None
+    for model in MODELS:
         try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
-
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
-
-
-def _safe_slug(title: str) -> str:
-    s = title.strip().lower()
-    s = re.sub(r"[^a-z0-9 _-]+", "", s)
-    s = re.sub(r"\s+", "_", s).strip("_")
-    return s or "blog"
-
+            response = requests.post(
+                f"https://router.huggingface.co/hf-inference/models/{model}",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={"inputs": prompt},
+                timeout=120,
+            )
+            if response.status_code == 200:
+                return response.content
+            last_error = f"{model}: {response.status_code} - {response.text}"
+        except Exception as e:
+            last_error = str(e)
+    
+    raise RuntimeError(f"All models failed. Last error: {last_error}")
 
 def generate_and_place_images(state: State) -> dict:
+
     plan = state["plan"]
     assert plan is not None
 
@@ -489,7 +532,7 @@ def generate_and_place_images(state: State) -> dict:
 
     # If no images requested, just write merged markdown
     if not image_specs:
-        filename = f"{_safe_slug(plan.blog_title)}.md"
+        filename = f"{plan.blog_title}.md"
         Path(filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
@@ -499,30 +542,33 @@ def generate_and_place_images(state: State) -> dict:
     for spec in image_specs:
         placeholder = spec["placeholder"]
         filename = spec["filename"]
-        out_path = images_dir / filename
+        
+        clean_filename = filename.replace("images/", "").replace("images\\", "")
+        out_path = images_dir / clean_filename
 
-        # generate only if needed
         if not out_path.exists():
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _generate_image_bytes(spec["prompt"])
                 out_path.write_bytes(img_bytes)
             except Exception as e:
-                # graceful fallback: keep doc usable
                 prompt_block = (
                     f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
+                    f"> **Alt:** {spec.get('alt','')}\n"
                     f"> **Prompt:** {spec.get('prompt','')}\n>\n"
                     f"> **Error:** {e}\n"
                 )
                 md = md.replace(placeholder, prompt_block)
                 continue
 
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        img_md = f"![{spec['alt']}](images/{clean_filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
-    filename = f"{_safe_slug(plan.blog_title)}.md"
+    filename = f"{plan.blog_title}.md"
     Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
+
+
+
 
 # build reducer subgraph
 reducer_graph = StateGraph(State)
@@ -535,24 +581,51 @@ reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
 
-# -----------------------------
-# 9) Build main graph
-# -----------------------------
+
 g = StateGraph(State)
 g.add_node("router", router_node)
 g.add_node("research", research_node)
 g.add_node("orchestrator", orchestrator_node)
-g.add_node("worker", worker_node)
+g.add_node("sequential_workers", fanout)  # ← worker node nahi, fanout node
 g.add_node("reducer", reducer_subgraph)
 
 g.add_edge(START, "router")
-g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
+g.add_conditional_edges(
+    "router",
+    lambda s: "research" if s.get("needs_research") else "orchestrator",
+    {"research": "research", "orchestrator": "orchestrator"}
+)
 g.add_edge("research", "orchestrator")
-
-g.add_conditional_edges("orchestrator", fanout, ["worker"])
-g.add_edge("worker", "reducer")
+g.add_edge("orchestrator", "sequential_workers")  # ← direct edge, no fanout
+g.add_edge("sequential_workers", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
 
+
+# ------------------------------------
+# 10) Runner
+# ------------------------------------
+def run(topic: str, as_of: Optional[str] = None):
+    if as_of is None:
+        as_of = date.today().isoformat()
+
+    out = app.invoke(
+        {
+            "topic": topic,
+            "mode": "",
+            "needs_research": False,
+            "queries": [],
+            "evidence": [],
+            "plan": None,
+            "as_of": as_of,
+            "recency_days": 7,
+            "sections": [],
+            "merged_md": "",
+            "md_with_placeholders": "",
+            "image_specs": [],
+            "final": "",
+        }
+    )
+
+    return out
